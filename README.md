@@ -1,4 +1,4 @@
 # ProiectPI
-Proiect PI \n
-Masurarea pulsului fara contact prin videocamera \n
+Proiect PI 
+Masurarea pulsului fara contact prin videocamera 
 (Remote PPG/rPPG)
