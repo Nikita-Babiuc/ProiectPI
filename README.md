@@ -28,4 +28,4 @@ Aplicații/proiecte relevante:
 | 4 |Z Yu, Y Shen, J Shi, H. Zhao, P. Torr, G. Zhao(2021) |PhysFormer |Telemedicină |PyTorch, Vision Transformers |Transformer spațio-temporal ce extrage variațiile periodice de culoare ale pielii. |MAE = 2.84 bpm |Reține resurse mari de calcul; sensibil la mișcări bruște. | |
 | 5 |Wang, W.,Brinker, A. C., Stuijk,Haan(2017)|Plane Orthogonal-to-Skin (POS) algorithm |Telemedicină|Python,NumPy|Combină matematic canalele RGB pe un plan ortogonal pe culoarea pielii pentru a elimina mișcarea, fără AI. | MAE = 2.35 bmp | Sensibil la schimbări rapide de lumină și umbre| Implementare mai ușoară |
 
-
+*MAE = mean absolute error
