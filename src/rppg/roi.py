@@ -203,7 +203,7 @@ if __name__ == "__main__":
                     f"px={roi.n_pixels} valid={roi.valid} skin={roi.skin_used} "
                     f"RGB=({r:.0f},{g:.0f},{b:.0f})"
                 )
-                color = (0, 255, 0) if roi.valid else (0, 165, 255)
+            color = (0, 255, 0) if roi.valid else (0, 165, 255)
             cv2.putText(vis, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.imshow("roi", vis)
             key = cv2.waitKey(1) & 0xFF
