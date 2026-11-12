@@ -16,8 +16,10 @@ log = logging.getLogger(__name__)
 
 
 FOREHEAD = [67, 109, 10, 338, 297, 334, 296, 336, 9, 107, 66, 105]
-RIGHT_CHEEK = [116, 117, 118, 101, 36, 205, 207, 213, 147, 123]
-LEFT_CHEEK = [345, 346, 347, 330, 266, 425, 427, 433, 376, 352]
+RIGHT_CHEEK = [228, 229, 230, 231, 120, 100, 36, 205, 50, 117]
+LEFT_CHEEK = [448, 449, 450, 451, 349, 329, 266, 425, 280, 346]
+# RIGHT_CHEEK = [116, 117, 118, 101, 36, 205, 207, 213, 147, 123]
+# LEFT_CHEEK = [345, 346, 347, 330, 266, 425, 427, 433, 376, 352]
 
 FACE_OVAL = [
     10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378,
@@ -98,8 +100,8 @@ def skin_mask(
     lower = np.array([min_luma, cr_range[0], cb_range[0]], dtype=np.uint8)
     upper = np.array([255, cr_range[1], cb_range[1]], dtype=np.uint8)
     mask = cv2.inRange(ycrcb, lower, upper)
-    mask[image_bgr.max(axis=2) >= max_channel] = 0
-    return mask
+    unsaturated = cv2.inRange(image_bgr, (0, 0, 0), (max_channel - 1,) * 3)
+    return cv2.bitwise_and(mask, unsaturated)
 
 
 class RoiExtractor:
@@ -129,8 +131,12 @@ class RoiExtractor:
 
         skin_used = False
         if cfg.use_skin_mask:
-            skin = skin_mask(
-                image_bgr, cfg.cr_range, cfg.cb_range, cfg.min_luma, cfg.max_channel
+            # Computes the skin mask only inside the face bbox to save time
+            x0, y0, x1, y1 = face.bbox
+            skin = np.zeros((h, w), dtype=np.uint8)
+            skin[y0: y1 + 1, x0: x1 + 1] = skin_mask(
+                image_bgr[y0: y1 + 1, x0: x1 + 1],
+                cfg.cr_range, cfg.cb_range, cfg.min_luma, cfg.max_channel,
             )
             kept: dict[str, np.ndarray] = {}
             for name, m in masks.items():
@@ -203,7 +209,7 @@ if __name__ == "__main__":
                     f"px={roi.n_pixels} valid={roi.valid} skin={roi.skin_used} "
                     f"RGB=({r:.0f},{g:.0f},{b:.0f})"
                 )
-            color = (0, 255, 0) if roi.valid else (0, 165, 255)
+                color = (0, 255, 0) if roi.valid else (0, 165, 255)
             cv2.putText(vis, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.imshow("roi", vis)
             key = cv2.waitKey(1) & 0xFF

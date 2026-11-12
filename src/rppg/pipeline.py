@@ -1,217 +1,309 @@
+# Pipeline rPPG multi-thread: frame -> fata -> ROI -> trace RGB -> resample -> POS -> bandpass -> puls -> netezire.
+# Fiecare etapa ruleaza in propriul thread, etapele sunt legate prin cozi.
+
+from __future__ import annotations
+
+import logging
+import sys
 import threading
-from queue import Queue, Empty
-from tabnanny import NannyNag
+from dataclasses import dataclass, field
+from queue import Empty, Full, Queue
+from typing import Callable, Iterator, Optional
 
 import cv2
+import numpy as np
 
-from .capture import open_source
-from .face import FaceTracker
+from .capture import Frame, open_source
+from .face import FaceResult, FaceTracker
 from .filters import clean_pulse, resample_uniform
-from .hr import HrEstimate, HrTracker, estimate_hr
+from .hr import HrConfig, HrEstimate, HrTracker, TrackerConfig, estimate_hr
 from .pos import pos
-from .roi import RoiExtractor, draw_roi
-from .signal_trace import SignalTrace
+from .roi import RoiConfig, RoiExtractor, RoiResult
+from .signal_trace import SignalTrace, TraceConfig
+from .utils import build_dataclass
+
+log = logging.getLogger(__name__)
+
+_INVALID = HrEstimate(float("nan"), float("nan"), float("nan"), False)
 
 
+# Ruleaza resample, POS, bandpass si spectrul pe un trace. Intoarce estimarea si pulsul.
+def estimate_from_trace(t: np.ndarray, rgb: np.ndarray, cfg: "PipelineConfig") -> tuple[HrEstimate, np.ndarray]:
+    if len(t) < 2 or t[-1] - t[0] < cfg.hr.min_seconds:
+        return _INVALID, np.empty(0)
+    _, rgb_u = resample_uniform(t, rgb, cfg.fs)
+    pulse = pos(rgb_u, cfg.fs, cfg.pos_window_seconds)
+    pulse = clean_pulse(pulse, cfg.fs, cfg.hr.low_hz, cfg.hr.high_hz, cfg.filter_order)
+    return estimate_hr(pulse, cfg.fs, cfg.hr), pulse
 
 
-def start_pipeline():
-    frame_queue = Queue(maxsize=30)
-    face_queue = Queue(maxsize=30)
-    roi_queue = Queue(maxsize=30)
-    signal_queue  = Queue(maxsize=30)
-    result_queue = Queue(maxsize=30)
+# Banda filtrului se ia din hr.low_hz si hr.high_hz
+@dataclass
+class PipelineConfig:
+    fs: float = 30.0
+    pos_window_seconds: float = 1.6
+    filter_order: int = 3
+    update_interval: float = 1.0
+    face: dict = field(default_factory=dict)
+    trace: TraceConfig = field(default_factory=TraceConfig)
+    roi: RoiConfig = field(default_factory=RoiConfig)
+    hr: HrConfig = field(default_factory=HrConfig)
+    tracker: TrackerConfig = field(default_factory=TrackerConfig)
 
-    t1 = threading.Thread(
-        target=capture_stage,
-        args=(frame_queue,),
-        daemon=True
-    )
+    # Construieste config-ul dintr-un dict, sectiunea capture este ignorata
+    @classmethod
+    def from_dict(cls, data: Optional[dict] = None) -> "PipelineConfig":
+        data = dict(data or {})
+        data.pop("capture", None)
+        return cls(
+            trace=build_dataclass(TraceConfig, data.pop("trace", None)),
+            roi=build_dataclass(RoiConfig, data.pop("roi", None)),
+            hr=build_dataclass(HrConfig, data.pop("hr", None)),
+            tracker=build_dataclass(TrackerConfig, data.pop("tracker", None)),
+            **data,
+        )
 
-    t2 = threading.Thread(
-        target = face_detection_stage,
-        args=(frame_queue,face_queue),
-        daemon=True
-    )
-    t3 = threading.Thread(
-        target = roi_stage,
-        args=(face_queue,roi_queue,),
-        daemon=True
-    )
 
-    t4 = threading.Thread(
-        target = signal_stage,
-        args=(roi_queue,signal_queue,),
-        daemon=True
-    )
-    t5 = threading.Thread(
-        target = pulse_stage,
-        args=(signal_queue,result_queue,),
-        daemon=True
-    )
+# Rezultatul pentru fiecare frame care iese din pipeline.
+# is_new = True doar cand s-a calculat o estimare noua (aprox. o data pe update_interval).
+@dataclass(frozen=True)
+class FrameOutput:
+    frame: Frame
+    roi: Optional[RoiResult]
+    face: Optional[FaceResult]
+    bpm: Optional[float]
+    estimate: HrEstimate
+    pulse: np.ndarray
+    duration: float
+    is_new: bool
+    status: str
 
-    t1.start()
-    t2.start()
-    t3.start()
-    t4.start()
-    t5.start()
+    @property
+    def timestamp(self) -> float:
+        return self.frame.timestamp
 
-    try:
-        while True:
+
+# Pune un element in coada, renunta cand pipeline-ul se opreste.
+def _put(q: Queue, item, stop: threading.Event) -> bool:
+    while not stop.is_set():
+        try:
+            q.put(item, timeout=0.1)
+            return True
+        except Full:
+            pass
+    return False
+
+
+# Ia un element din coada, intoarce None (sfarsit de stream) cand pipeline-ul se opreste.
+def _get(q: Queue, stop: threading.Event):
+    while not stop.is_set():
+        try:
+            return q.get(timeout=0.1)
+        except Empty:
+            pass
+    return None
+
+
+# Foloseste DirectShow pentru webcam pe Windows, backend-ul implicit merge slab acolo.
+def default_camera_kwargs(source) -> dict:
+    if isinstance(source, int) and sys.platform == "win32":
+        return {"backend": cv2.CAP_DSHOW}
+    return {}
+
+
+class RPPGPipeline:
+    # source: index camera, cale video sau o sursa deja deschisa (de ex. din build_source)
+    # face_tracker: optional, altfel se creeaza FaceTracker in thread-ul de detectie
+    def __init__(
+        self,
+        source=0,
+        config: Optional[PipelineConfig] = None,
+        camera_kwargs: Optional[dict] = None,
+        face_tracker: Optional[FaceTracker] = None,
+        queue_size: int = 30,
+    ):
+        self.cfg = config or PipelineConfig()
+        if self.cfg.fs <= 2.0 * self.cfg.hr.high_hz:
+            raise ValueError("fs must be above twice hr.high_hz")
+        if self.cfg.trace.window_seconds < self.cfg.hr.min_seconds:
+            raise ValueError("trace.window_seconds must be at least hr.min_seconds")
+
+        self._source_arg = source
+        self._camera_kwargs = default_camera_kwargs(source) if camera_kwargs is None else camera_kwargs
+
+        # Obiectele etapelor sunt expuse pentru statistici si control (skin on/off, rezultate trace)
+        self.source = None
+        self.face: Optional[FaceTracker] = face_tracker
+        self.roi = RoiExtractor(self.cfg.roi)
+        self.trace = SignalTrace(self.cfg.trace)
+        self.tracker = HrTracker(self.cfg.tracker)
+
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._reset_gen = 0  # crescut de reset(), etapele isi golesc starea cand il vad schimbat
+
+        self._frame_q: Queue = Queue(maxsize=queue_size)
+        self._face_q: Queue = Queue(maxsize=queue_size)
+        self._roi_q: Queue = Queue(maxsize=queue_size)
+        self._signal_q: Queue = Queue(maxsize=queue_size)
+        self._result_q: Queue = Queue(maxsize=queue_size)
+
+    # Porneste thread-urile
+    def start(self) -> "RPPGPipeline":
+        if self._threads:
+            return self
+        stages = [
+            ("capture", self._capture_stage, self._frame_q),
+            ("face", self._face_stage, self._face_q),
+            ("roi", self._roi_stage, self._roi_q),
+            ("signal", self._signal_stage, self._signal_q),
+            ("pulse", self._pulse_stage, self._result_q),
+        ]
+        for name, fn, out_q in stages:
+            t = threading.Thread(target=self._run_stage, args=(name, fn, out_q), name=name, daemon=True)
+            self._threads.append(t)
+            t.start()
+        return self
+
+    # Opreste thread-urile, camera se elibereaza si trackerul de fata se inchide
+    def stop(self) -> None:
+        self._stop.set()
+        for t in self._threads:
+            t.join(timeout=2.0)
+
+    # Goleste starea (trace + tracker), de ex. cand se schimba persoana
+    def reset(self) -> None:
+        self._reset_gen += 1
+
+    # Intoarce rezultatele frame cu frame, se termina la sfarsitul sursei sau la stop()
+    def results(self) -> Iterator[FrameOutput]:
+        while not self._stop.is_set():
             try:
-                result = result_queue.get(timeout=0.5)
+                out = self._result_q.get(timeout=0.5)
             except Empty:
                 continue
-
-            if result is None:
-                break
-
-            frame, roi, face, bpm, estimate, duration, is_new = result
-
-            if is_new:
-                shown = "--" if bpm is None else f"{bpm:.1f}"
-                print(
-                    f"t={frame.timestamp:6.1f}s  bpm={shown:>5}  raw={estimate.bpm:6.1f}  "
-                    f"snr={estimate.snr_db:5.1f} dB  valid={estimate.valid}"
-                )
-
-            cv2.imshow("heart rate", draw_frame(frame, roi, face, bpm, estimate, duration))
-
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                print("stopped")
+            if out is None:
                 return
+            yield out
 
-        t1.join()
-        t2.join()
-        t3.join()
-        t4.join()
-        t5.join()
-    except KeyboardInterrupt:
-        print("stopped")
-    finally:
-        cv2.destroyAllWindows()
+    @property
+    def bpm(self) -> Optional[float]:
+        return self.tracker.bpm
 
+    def __enter__(self) -> "RPPGPipeline":
+        return self.start()
 
-def capture_stage(frame_queue):
+    def __exit__(self, *exc) -> None:
+        self.stop()
 
-    source = open_source(0)
+    # Ruleaza o etapa, logheaza erorile si trimite mereu None mai departe, ca bucla principala sa nu astepte la infinit.
+    def _run_stage(self, name: str, fn: Callable[[], None], out_q: Queue) -> None:
+        try:
+            fn()
+        except Exception:
+            log.exception("Stage '%s' stopped", name)
+        finally:
+            _put(out_q, None, self._stop)
 
-    with source:
-        for frame in source:
-            frame_queue.put(frame)
+    def _capture_stage(self) -> None:
+        src = self._source_arg
+        if isinstance(src, (int, str)):
+            src = open_source(src, **self._camera_kwargs)
+        self.source = src
+        with src:
+            for frame in src:
+                if not _put(self._frame_q, frame, self._stop):
+                    break
 
-    frame_queue.put(None)
+    def _face_stage(self) -> None:
+        # Trackerul se creeaza in acest thread (MediaPipe nu iubeste schimbarea de thread)
+        tracker = self.face or FaceTracker(**self.cfg.face)
+        self.face = tracker
+        try:
+            while True:
+                frame = _get(self._frame_q, self._stop)
+                if frame is None:
+                    break
+                # Frame-urile fara fata trec mai departe, ca afisarea sa nu ingheate.
+                if not _put(self._face_q, (frame, tracker.process(frame)), self._stop):
+                    break
+        finally:
+            tracker.close()
 
-def face_detection_stage(frame_queue, face_queue):
-
-    with FaceTracker() as tracker:
-
+    def _roi_stage(self) -> None:
         while True:
-
-            frame = frame_queue.get()
-
-            if frame is None:
+            data = _get(self._face_q, self._stop)
+            if data is None:
+                break
+            frame, face = data
+            roi = self.roi.extract(frame.image, face) if face is not None else None
+            # Frame-urile fara fata sau cu ROI invalid trec mai departe, trace-ul le sare si detecteaza golurile.
+            if not _put(self._roi_q, (frame, roi, face), self._stop):
                 break
 
-            face = tracker.process(frame)
+    def _signal_stage(self) -> None:
+        next_send = None
+        gen = self._reset_gen
+        while True:
+            data = _get(self._roi_q, self._stop)
+            if data is None:
+                break
+            frame, roi, face = data
 
-            if face is not None:
-                face_queue.put((frame, face))
+            if gen != self._reset_gen:
+                gen = self._reset_gen
+                self.trace.clear()
+                next_send = None
 
-        face_queue.put(None)
+            self.trace.update(frame.timestamp, frame.image, roi)
+            snapshot = None
+            if next_send is None:
+                next_send = frame.timestamp + self.cfg.update_interval
+            if frame.timestamp >= next_send:
+                next_send = frame.timestamp + self.cfg.update_interval
+                snapshot = self.trace.get()
 
-def roi_stage(face_queue, roi_queue):
+            if not _put(self._signal_q, (frame, roi, face, snapshot, self.trace.duration), self._stop):
+                break
 
-    extractor = RoiExtractor()
+    def _pulse_stage(self) -> None:
+        estimate = _INVALID
+        pulse = np.empty(0)
+        gen = self._reset_gen
+        while True:
+            data = _get(self._signal_q, self._stop)
+            if data is None:
+                break
+            frame, roi, face, snapshot, duration = data
 
-    while True:
-        data = face_queue.get()
+            if gen != self._reset_gen:
+                gen = self._reset_gen
+                self.tracker.reset()
+                estimate = _INVALID
+                pulse = np.empty(0)
 
-        if data is None:
-            break
+            is_new = snapshot is not None
+            if is_new:
+                t, rgb = snapshot
+                estimate, p = estimate_from_trace(t, rgb, self.cfg)
+                if p.size:
+                    pulse = p
+                # Trackerul se actualizeaza la fiecare tick, ca sa poata tine sau arunca valoarea cand semnalul se pierde
+                self.tracker.update(frame.timestamp, estimate)
 
-        frame, face = data
+            out = FrameOutput(
+                frame, roi, face, self.tracker.bpm, estimate, pulse, duration, is_new,
+                self._status(face, roi, duration, estimate),
+            )
+            if not _put(self._result_q, out, self._stop):
+                break
 
-        roi = extractor.extract(frame.image, face)
-
-        if roi.valid:
-            roi_queue.put((frame, roi, face))
-
-    roi_queue.put(None)
-
-def signal_stage(roi_queue, signal_queue):
-    trace = SignalTrace()
-
-    last_sent = 0.0
-
-    while True:
-        data = roi_queue.get()
-
-        if data is None:
-            break
-
-        frame, roi, face = data
-
-        trace.update(frame.timestamp, frame.image, roi)
-        snapshot = None
-        if frame.timestamp - last_sent >= 1.0:
-            last_sent = frame.timestamp
-            snapshot = trace.get()
-
-        signal_queue.put((frame, roi, face, snapshot, trace.duration))
-
-    signal_queue.put(None)
-
-
-def pulse_stage(signal_queue, result_queue):
-    tracker = HrTracker()
-    estimate = None
-
-    while True:
-        data = signal_queue.get()
-
-        if data is None:
-            break
-
-        frame, roi, face, snapshot, duration = data
-
-        is_new = snapshot is not None
-
-        if is_new:
-            t, rgb = snapshot
-
-            if len(t) >= 2:
-                _, rgb_uniform = resample_uniform(t, rgb, 30)
-                pulse = clean_pulse(pos(rgb_uniform, 30), 30)
-                estimate = estimate_hr(pulse, 30)
-            else:
-                estimate = HrEstimate(float("nan"), float("nan"), float("nan"), False)
-            tracker.update(frame.timestamp, estimate)
-
-        result_queue.put((frame, roi, face, tracker.bpm, estimate, duration, is_new))
-
-    result_queue.put(None)
-
-
-def draw_frame(frame, roi, face, bpm, estimate, duration):
-    image = frame.image.copy()
-
-    if roi is not None:
-        draw_roi(image, roi)
-
-    if face is None:
-        status, color = "no face", (0, 0, 255)
-    elif estimate is None or duration < 5:
-        status, color = f"collecting {duration:.0f}/5 s", (0, 165, 255)
-    else:
-        status = f"raw {estimate.bpm:.1f}  snr {estimate.snr_db:.1f} dB  valid {estimate.valid}"
-        color = (0, 255, 0) if estimate.valid else (0, 0, 255)
-
-    height = image.shape[0]
-    title = "HR --" if bpm is None else f"HR {bpm:.0f} bpm"
-    cv2.putText(image, title, (10, height - 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
-    cv2.putText(image, status, (10, height - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-
-    return image
-if __name__ == "__main__":
-    start_pipeline()
+    # Text scurt cu starea pipeline-ului, pentru overlay
+    def _status(self, face, roi, duration: float, estimate: HrEstimate) -> str:
+        if face is None:
+            return "no face"
+        if roi is None or not roi.valid:
+            return "bad roi"
+        if duration < self.cfg.hr.min_seconds:
+            return f"collecting {duration:.0f}/{self.cfg.hr.min_seconds:.0f}s"
+        return "tracking" if estimate.valid else "low quality"

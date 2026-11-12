@@ -175,6 +175,7 @@ class WebcamCapture(FrameSource):
             if frame is not None:
                 return frame
             failures += 1
+            time.sleep(0.01)  # waits briefly so the failure limit covers a real time span
         log.error("Camera stopped delivering frames")
         return None
 
@@ -200,6 +201,7 @@ class WebcamCapture(FrameSource):
                     if failures >= self.cfg.max_consecutive_failures:
                         log.error("Camera stopped delivering frames")
                         break
+                    time.sleep(0.01)
                     continue
                 failures = 0
                 self._enqueue(frame)

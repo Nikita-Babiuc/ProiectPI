@@ -1,0 +1,71 @@
+# Default settings. Every key is optional, anything left out uses the default from the code.
+# Unknown keys raise an error, so a typo is caught at startup.
+#
+#   python scripts/run_webcam.py 0 --config configs/default.yaml
+#
+# Command line options (--no-skin, --cr, --unlock-wb, ...) override this file.
+
+# Camera, only used for webcams. Fields of CameraConfig in capture.py.
+capture:
+  backend: auto            # auto (DirectShow on Windows), dshow, msmf or any
+  width: 640
+  height: 480
+  fps: 30
+  fourcc: MJPG             # MJPG keeps the frames less compressed over USB
+  lock_exposure: true      # auto exposure creates fake pulse-like changes
+  lock_white_balance: true # set to false if the image has a strong color cast
+  lock_autofocus: true
+  exposure: null           # manual value, the scale depends on the camera driver
+  wb_temperature: null     # manual value in Kelvin, only used when white balance is locked
+  focus: null
+  threaded: true
+  queue_size: 64
+  warmup_frames: 10
+  max_consecutive_failures: 30
+
+# Face landmarker, passed to FaceTracker in face.py.
+face:
+  model_path: null         # null = download to ~/.cache/rppg on first run
+  min_detection_confidence: 0.5
+  min_presence_confidence: 0.5
+  min_tracking_confidence: 0.5
+  smooth: 0.5              # landmark smoothing, 0 = off, higher = steadier but laggy
+
+# Region of interest, RoiConfig in roi.py.
+roi:
+  regions: [forehead, cheeks]   # forehead, left_cheek, right_cheek, face, or the preset cheeks
+  erode_frac: 0.02              # shrinks each region by this fraction of the face width
+  use_skin_mask: true
+  cr_range: [133, 173]          # skin color range in YCrCb
+  cb_range: [77, 127]
+  min_luma: 30
+  max_channel: 250              # pixels at or above this in any channel are dropped
+  min_skin_fraction: 0.3        # a region with less skin than this is dropped, 0 = never drop
+  min_pixels: 200
+
+# Buffer of recent RGB samples, TraceConfig in signal_trace.py.
+trace:
+  window_seconds: 10.0
+  max_gap_seconds: 1.0          # a longer gap clears the buffer
+
+# Pipeline.
+fs: 30.0                        # rate the trace is resampled to, must be above 2 * hr.high_hz
+pos_window_seconds: 1.6
+filter_order: 3
+update_interval: 1.0            # seconds between heart rate updates
+
+# Spectrum and quality, HrConfig in hr.py. low_hz and high_hz are also the filter band.
+hr:
+  low_hz: 0.7                   # 42 bpm
+  high_hz: 3.0                  # 180 bpm
+  segment_seconds: 10.0
+  resolution_hz: 0.01
+  peak_halfwidth_hz: 0.2
+  min_seconds: 5.0              # data needed before the first estimate
+  min_snr_db: 3.0               # estimates below this are marked as low quality
+
+# Smoothing of the displayed value, TrackerConfig in hr.py.
+tracker:
+  smoothing_seconds: 3.0
+  max_change_bpm_per_s: 8.0
+  hold_seconds: 5.0             # how long the last value is kept when the signal is lost
