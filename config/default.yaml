@@ -15,7 +15,7 @@ capture:
   lock_exposure: true      # auto exposure creates fake pulse-like changes
   lock_white_balance: true # set to false if the image has a strong color cast
   lock_autofocus: true
-  exposure: null           # manual value, the scale depends on the camera driver
+  exposure: -5           # manual value, the scale depends on the camera driver
   wb_temperature: null     # manual value in Kelvin, only used when white balance is locked
   focus: null
   threaded: true
